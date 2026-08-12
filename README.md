@@ -204,8 +204,11 @@ that exposes an OpenAI-Chat-Completions-compatible endpoint backed by the `codex
     codex login               # authenticates with your ChatGPT/Codex subscription
     pnpm codex-bridge          # starts the bridge on http://localhost:4321
 
-Then, in Workshop's **Add Model** dialog, choose provider **Ollama** → **"Other Ollama..."**, set
-the API URL to `http://localhost:4321`, and leave the API Token blank.
+Or start it together with the OS in one command: `pnpm run-local --with-codex-bridge`.
+
+Then, in Workshop's **Add Model** dialog, choose provider **Ollama / Local Server** →
+**"Other Ollama / Local Server..."**, set the API URL to `http://localhost:4321`, and leave the
+API Token blank.
 
 This only works for local development (a Cloudflare Worker can't shell out to a CLI itself — see
 the comment at the top of the script for why), and only for plain conversational chat: `codex exec`

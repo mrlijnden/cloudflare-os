@@ -10,6 +10,9 @@
 //   3. Launches the local server (run-dev-server.js --serve-frontend-assets), which serves the
 //      built frontend as static assets on the backend.
 //
+// Pass --with-codex-bridge to also launch scripts/codex-chat-bridge.mjs alongside it, so a single
+// `pnpm run-local --with-codex-bridge` gets you both the OS and the Codex-subscription bridge.
+//
 // To keep repeat runs fast, install + build are skipped entirely when nothing has changed. We hash
 // all source files (everything git tracks, plus untracked-but-not-ignored files) and compare
 // against a stored stamp. If the hash matches and the build outputs still exist, we skip straight
@@ -32,6 +35,12 @@ const NODE_MODULES = join(ROOT, "node_modules");
 
 // Forward any extra flags (e.g. --use-workers-ai-binding) on to run-dev-server.js.
 const passthroughArgs = process.argv.slice(2);
+
+// --with-codex-bridge: also launch scripts/codex-chat-bridge.mjs alongside the OS, so a single
+// command gets you both (see that script for what it does and why it's a separate process).
+// It's harmless to also forward this flag to run-dev-server.js below -- unrecognized flags there
+// are ignored, same as --use-workers-ai-binding would be if passed to something that ignores it.
+const withCodexBridge = passthroughArgs.includes("--with-codex-bridge");
 let backendHost;
 try {
   ({ backendHost } = getDevServerConfig(passthroughArgs, process.env.VITE_BACKEND_HOST));
@@ -147,13 +156,30 @@ if (needsBuild) {
 // Launch the local server (serves the built frontend as static assets).
 // ---------------------------------------------------------------------------
 
-console.log(`\nStarting local server at http://${backendHost} ...`);
-const server = spawn(
-    process.execPath,
-    [join(ROOT, "run-dev-server.js"), "--serve-frontend-assets", ...passthroughArgs],
-    { stdio: "inherit", cwd: ROOT });
+// Spawn a child with inherited stdio, tracked so that if any managed child exits, the others are
+// torn down with it rather than left running headless.
+const children = [];
+function spawnManaged(cmd, args) {
+  const child = spawn(cmd, args, { stdio: "inherit", cwd: ROOT });
+  children.push(child);
+  child.on("exit", (code, signal) => {
+    for (const other of children) {
+      if (other !== child && other.exitCode === null && other.signalCode === null) {
+        other.kill(signal ?? "SIGTERM");
+      }
+    }
+    if (signal) process.kill(process.pid, signal);
+    else process.exit(code ?? 0);
+  });
+  return child;
+}
 
-server.on("exit", (code, signal) => {
-  if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 0);
-});
+console.log(`\nStarting local server at http://${backendHost} ...`);
+spawnManaged(
+    process.execPath,
+    [join(ROOT, "run-dev-server.js"), "--serve-frontend-assets", ...passthroughArgs]);
+
+if (withCodexBridge) {
+  console.log("Starting the Codex chat bridge alongside it (see scripts/codex-chat-bridge.mjs) ...");
+  spawnManaged(process.execPath, [join(ROOT, "scripts", "codex-chat-bridge.mjs")]);
+}
