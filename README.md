@@ -193,6 +193,25 @@ This runs Cloudflare OS using `wrangler`, the Workers developer tooling CLI. Thi
 
 Your data will be stored in a subdirectory named `.wrangler`.
 
+#### Using your OpenAI Codex subscription instead of a metered API key
+
+Workshop's AI chat feature normally needs a provider API key (Anthropic, OpenAI, Google, or a
+Cloudflare Workers AI token) billed per token. If you'd rather use your existing ChatGPT/Codex
+subscription for local experimentation, `scripts/codex-chat-bridge.mjs` runs a small local server
+that exposes an OpenAI-Chat-Completions-compatible endpoint backed by the `codex` CLI:
+
+    npm i -g @openai/codex   # if you haven't already
+    codex login               # authenticates with your ChatGPT/Codex subscription
+    pnpm codex-bridge          # starts the bridge on http://localhost:4321
+
+Then, in Workshop's **Add Model** dialog, choose provider **Ollama** → **"Other Ollama..."**, set
+the API URL to `http://localhost:4321`, and leave the API Token blank.
+
+This only works for local development (a Cloudflare Worker can't shell out to a CLI itself — see
+the comment at the top of the script for why), and only for plain conversational chat: `codex exec`
+is an agentic coding tool, not a chat-completion function, so this bridge can't back Workshop's
+tool-calling gadget-building agent flows, only the AI chat feature.
+
 ### Deploy to your own server using `workerd`
 
 **COMING SOON**
