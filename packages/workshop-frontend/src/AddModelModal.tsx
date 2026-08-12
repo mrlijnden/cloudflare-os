@@ -21,7 +21,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   openai: 'OpenAI',
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
-  ollama: 'Ollama',
+  ollama: 'Ollama / Local Server',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -314,7 +314,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
               placeholder={API_TOKEN_PLACEHOLDERS[selection.provider]}
               description={
                 isOllama
-                  ? 'Optional for local Ollama access'
+                  ? 'Optional for local servers (Ollama, or a local bridge like scripts/codex-chat-bridge.mjs)'
                   : isCloudflare
                   ? 'An API token with Workers AI Read + Edit permissions (in the dashboard: Workers AI > Use REST API > Create a Workers AI API Token)'
                   : `Your ${PROVIDER_LABELS[selection.provider]} API token for billing`
@@ -331,7 +331,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             <Input
               label="API URL"
               placeholder="http://localhost:11434"
-              description="URL of your Ollama server"
+              description="URL of your Ollama server -- or a local OpenAI-compatible bridge, e.g. http://localhost:4321 for the Codex bridge (pnpm codex-bridge)"
               value={apiUrl}
               onChange={(e) => { setApiUrl(e.target.value); setErrors(prev => ({ ...prev, apiUrl: '' })) }}
               error={errors.apiUrl}
