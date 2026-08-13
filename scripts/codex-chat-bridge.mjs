@@ -24,26 +24,32 @@
 //     contract, so this bridge does not support gadget-building agent flows, only the plain AI
 //     chat feature. Tool/tool-result messages in the incoming history are rendered as inert text
 //     markers so requests don't crash, not executed as real tool calls.
-//   - Every request starts a *fresh* `codex exec` session, replaying the full conversation
-//     flattened into one prompt, rather than using `codex exec resume`. The Chat Completions
-//     client already resends the entire message history on every call, so this is simplest thing
-//     that is correct: no session-id bookkeeping, no risk of resuming the wrong session when
-//     multiple Workshop conversations are open at once. The tradeoff is no server-side session
-//     reuse, which mainly costs a bit of latency, not correctness.
-//   - Responses are NOT incrementally streamed token-by-token: this bridge waits for `codex exec`
-//     to finish, then emits the full reply as a couple of SSE chunks (enough to satisfy Workshop's
-//     always-streaming client). Real incremental streaming would mean parsing `codex exec --json`'s
-//     internal event schema, which isn't documented stably enough to build on.
+//   - Session resume: Chat Completions has no session concept of its own -- the client just resends
+//     the entire message history on every call. To still use `codex exec resume` (avoiding a cold
+//     CLI start on every turn), each reply is indexed by a content hash of "the history that led to
+//     it" (see conversationKey/sessions below); the next request's history-minus-its-last-message is
+//     hashed and looked up against that index. A hit means "this is the same conversation
+//     continuing" -> resume with just the new message. A miss (new conversation, or an earlier
+//     message was edited/regenerated) -> start fresh, replaying the whole history as one prompt. If
+//     a resume attempt fails outright (e.g. a stale/evicted session) before any output was sent to
+//     the client, it's retried once as a fresh session rather than failing the request.
+//   - Streaming is real but segment-level, not token-level: `codex exec --json` never emits partial
+//     tokens -- each agent_message only ever appears as one complete `item.completed` event. This
+//     bridge forwards each such segment to the client as soon as it arrives (so a multi-step reply
+//     appears in pieces as Codex produces them), but a single-segment reply still appears all at
+//     once, same as it would talking to Codex directly.
 //   - Runs with `--sandbox read-only`: Codex can read the scratch directory it runs in but never
 //     writes files or executes mutating commands. `codex exec` has no TTY here, so it already
-//     defaults to `approval: never` in this mode (there's nothing to prompt).
+//     defaults to `approval: never` in this mode (there's nothing to prompt). Note `codex exec
+//     resume` has no `--sandbox` flag of its own -- a resumed session keeps the sandbox mode it was
+//     first created with.
 
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 function parseArgs(argv) {
   const args = { port: 4321, codexBin: "codex", sandbox: "read-only", timeoutMs: 300_000 };
@@ -62,6 +68,10 @@ const args = parseArgs(process.argv.slice(2));
 // means it doesn't need to be a real git repo; keeping it separate from this actual repo means
 // Codex never sees (or could touch) this project's own files while answering chat messages.
 const SCRATCH_DIR = mkdtempSync(join(tmpdir(), "codex-chat-bridge-"));
+
+// conversationKey(history through the assistant's reply) -> { threadId }. Grows for the life of the
+// process; fine for personal local use (a handful of conversations at a time), not meant to bound.
+const sessions = new Map();
 
 function checkCodexAvailable() {
   const result = spawnSync(args.codexBin, ["--version"], { stdio: "pipe" });
@@ -105,24 +115,52 @@ function extractText(message) {
   return "";
 }
 
-// Run `codex exec` against a flattened prompt and resolve with its final reply text.
-function runCodexExec(prompt) {
+// Deterministic key for a message history, used to recognize "this request is the same
+// conversation as a reply we gave before, plus one new message" without the client sending any
+// session id of its own (see module doc comment).
+function conversationKey(messages) {
+  const hash = createHash("sha256");
+  for (const message of messages) {
+    hash.update(message.role ?? "");
+    hash.update("\0");
+    hash.update(extractText(message));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+// Run `codex exec` (fresh, or resuming `resumeThreadId`), calling `onSegment(text)` for each
+// agent_message as it completes. Resolves with { threadId, fullText } once the turn finishes.
+function runCodex({ prompt, resumeThreadId, onSegment }) {
   return new Promise((resolve, reject) => {
-    const outputPath = join(SCRATCH_DIR, `reply-${randomUUID()}.txt`);
-    const child = spawn(args.codexBin, [
-      "exec",
-      "--json",
-      "--skip-git-repo-check",
-      "--sandbox", args.sandbox,
-      "--output-last-message", outputPath,
-      prompt,
-    ], { cwd: SCRATCH_DIR, stdio: ["ignore", "pipe", "pipe"] });
+    const cliArgs = resumeThreadId
+        ? ["exec", "resume", resumeThreadId, "--json", "--skip-git-repo-check", prompt]
+        : ["exec", "--json", "--skip-git-repo-check", "--sandbox", args.sandbox, prompt];
+    const child = spawn(args.codexBin, cliArgs, { cwd: SCRATCH_DIR, stdio: ["ignore", "pipe", "pipe"] });
 
     let stderr = "";
+    let buffer = "";
+    let threadId = resumeThreadId ?? null;
+    const segments = [];
+
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type === "thread.started" && event.thread_id) {
+          threadId = event.thread_id;
+        } else if (event.type === "item.completed" && event.item?.type === "agent_message"
+            && typeof event.item.text === "string") {
+          segments.push(event.item.text);
+          onSegment(event.item.text);
+        }
+      }
+    });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    // Drain stdout (the --json event stream) without buffering it -- it's only used for the exit
-    // code / stderr below, not parsed, per the module doc comment above.
-    child.stdout.resume();
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -140,14 +178,12 @@ function runCodexExec(prompt) {
         reject(new Error(`codex exec exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
         return;
       }
-      try {
-        const reply = readFileSync(outputPath, "utf8").trim();
-        resolve(reply.length > 0 ? reply : "(codex exec returned no output)");
-      } catch (error) {
-        reject(new Error(`codex exec finished but no reply file was found: ${error.message}`));
-      } finally {
-        rmSync(outputPath, { force: true });
+      if (!threadId) {
+        reject(new Error("codex exec finished without reporting a thread id"));
+        return;
       }
+      const fullText = segments.join("\n\n").trim();
+      resolve({ threadId, fullText: fullText.length > 0 ? fullText : "(codex exec returned no output)" });
     });
   });
 }
@@ -160,27 +196,6 @@ function sendJson(res, status, body) {
 
 function sendOpenAiError(res, status, message) {
   sendJson(res, status, { error: { message, type: "codex_bridge_error" } });
-}
-
-// Emit a reply as a couple of OpenAI-style SSE `chat.completion.chunk` events -- not real
-// token-by-token streaming (see module doc comment), just enough shape for pi-ai's streaming
-// client, which requires at least one delta chunk plus a chunk carrying `finish_reason`.
-function streamReply(res, model, text) {
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
-  const id = `chatcmpl-${randomUUID()}`;
-  const created = Math.floor(Date.now() / 1000);
-  const chunk = (delta, finishReason = null) => JSON.stringify({
-    id, object: "chat.completion.chunk", created, model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
-  });
-  res.write(`data: ${chunk({ role: "assistant", content: text })}\n\n`);
-  res.write(`data: ${chunk({}, "stop")}\n\n`);
-  res.write("data: [DONE]\n\n");
-  res.end();
 }
 
 function sendNonStreamingReply(res, model, text) {
@@ -210,19 +225,76 @@ const server = createServer((req, res) => {
       return;
     }
 
-    const prompt = flattenMessages(request.messages);
+    const messages = request.messages ?? [];
+    if (messages.length === 0) {
+      sendOpenAiError(res, 400, "No messages in request");
+      return;
+    }
+
+    const model = request.model ?? "codex";
+    const streaming = request.stream !== false;
+    const priorKey = conversationKey(messages.slice(0, -1));
+    let existing = sessions.get(priorKey);
+    let prompt = existing ? extractText(messages[messages.length - 1]) : flattenMessages(messages);
     if (!prompt) {
       sendOpenAiError(res, 400, "No usable text content in messages");
       return;
     }
 
-    console.log(`[codex-chat-bridge] ${new Date().toISOString()} prompt (${prompt.length} chars)`);
+    // SSE headers/id are only opened on the first segment, so a same-request retry-as-fresh (see
+    // below) that hasn't emitted anything yet can still cleanly fall back without corrupting the
+    // response; once opened, we're committed to this stream.
+    let sseStarted = false;
+    let sseId, sseCreated;
+    const emitSegment = (text) => {
+      if (!streaming) return;
+      if (!sseStarted) {
+        sseStarted = true;
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        sseId = `chatcmpl-${randomUUID()}`;
+        sseCreated = Math.floor(Date.now() / 1000);
+      }
+      const chunk = JSON.stringify({
+        id: sseId, object: "chat.completion.chunk", created: sseCreated, model,
+        choices: [{ index: 0, delta: { role: "assistant", content: `${text}\n\n` }, finish_reason: null }],
+      });
+      res.write(`data: ${chunk}\n\n`);
+    };
+
+    console.log(
+      `[codex-chat-bridge] ${new Date().toISOString()} ${existing ? "resume" : "fresh"} ` +
+      `prompt (${prompt.length} chars)`
+    );
     try {
-      const reply = await runCodexExec(prompt);
-      if (request.stream === false) {
-        sendNonStreamingReply(res, request.model ?? "codex", reply);
+      let result;
+      try {
+        result = await runCodex({ prompt, resumeThreadId: existing?.threadId, onSegment: emitSegment });
+      } catch (resumeError) {
+        if (!existing || sseStarted) throw resumeError;
+        console.error(`[codex-chat-bridge] resume failed (${resumeError.message}); retrying fresh`);
+        existing = undefined;
+        prompt = flattenMessages(messages);
+        result = await runCodex({ prompt, resumeThreadId: undefined, onSegment: emitSegment });
+      }
+
+      const { threadId, fullText } = result;
+      sessions.set(conversationKey([...messages, { role: "assistant", content: fullText }]), { threadId });
+
+      if (streaming) {
+        if (!sseStarted) emitSegment(fullText); // defensive: turn produced no agent_message segments
+        const finishChunk = JSON.stringify({
+          id: sseId, object: "chat.completion.chunk", created: sseCreated, model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        });
+        res.write(`data: ${finishChunk}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
       } else {
-        streamReply(res, request.model ?? "codex", reply);
+        sendNonStreamingReply(res, model, fullText);
       }
     } catch (error) {
       console.error(`[codex-chat-bridge] error: ${error.message}`);
